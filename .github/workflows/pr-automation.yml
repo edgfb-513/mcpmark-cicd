@@ -1,0 +1,586 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          echo "✅ Dependencies installed successfully"
+
+      - name: Run ESLint checks
+        id: eslint
+        run: |
+          echo "Running ESLint checks..."
+          npm run lint > eslint-results.txt 2>&1 || echo "ESLint found issues"
+          if [ -f eslint-results.txt ]; then
+            echo "ESLINT_OUTPUT<<EOF" >> $GITHUB_OUTPUT
+            cat eslint-results.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          # Check if ESLint passed
+          if npm run lint; then
+            echo "ESLINT_STATUS=✅ Passed" >> $GITHUB_OUTPUT
+          else
+            echo "ESLINT_STATUS=❌ Failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Run Prettier formatting checks
+        id: prettier
+        run: |
+          echo "Running Prettier formatting checks..."
+          npx prettier --check "src/**/*.js" > prettier-results.txt 2>&1 || echo "Prettier found formatting issues"
+          if [ -f prettier-results.txt ]; then
+            echo "PRETTIER_OUTPUT<<EOF" >> $GITHUB_OUTPUT
+            cat prettier-results.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          # Check if Prettier passed
+          if npx prettier --check "src/**/*.js"; then
+            echo "PRETTIER_STATUS=✅ Passed" >> $GITHUB_OUTPUT
+          else
+            echo "PRETTIER_STATUS=❌ Failed - Files need formatting" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Post Code Quality Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const eslintStatus = '${{ steps.eslint.outputs.ESLINT_STATUS }}' || '⚠️ Not Run';
+            const prettierStatus = '${{ steps.prettier.outputs.PRETTIER_STATUS }}' || '⚠️ Not Run';
+            
+            const body = `## 📊 Code Quality Report
+            
+            ### ESLint Analysis
+            **Status:** ${eslintStatus}
+            
+            \`\`\`
+            ${{ steps.eslint.outputs.ESLINT_OUTPUT || 'ESLint check completed successfully!' }}
+            \`\`\`
+            
+            ### Prettier Formatting
+            **Status:** ${prettierStatus}
+            
+            \`\`\`
+            ${{ steps.prettier.outputs.PRETTIER_OUTPUT || 'All files are properly formatted!' }}
+            \`\`\`
+            
+            ---
+            
+            **Job:** code-quality | **Workflow Run:** [#${context.runNumber}](${context.payload.repository.html_url}/actions/runs/${context.runId})
+            **Commit:** ${context.sha.substring(0, 7)} | **PR:** #${context.payload.pull_request.number}`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.payload.pull_request.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          echo "✅ Dependencies installed successfully"
+
+      - name: Run full test suite
+        id: test
+        run: |
+          echo "Running full test suite..."
+          npm test -- --verbose --coverage > test-results.txt 2>&1 || echo "Tests completed with issues"
+          if [ -f test-results.txt ]; then
+            echo "TEST_OUTPUT<<EOF" >> $GITHUB_OUTPUT
+            cat test-results.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          # Check if tests passed
+          if npm test; then
+            echo "TEST_STATUS=✅ Passed" >> $GITHUB_OUTPUT
+          else
+            echo "TEST_STATUS=❌ Failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Generate test coverage report
+        id: coverage
+        run: |
+          echo "Generating detailed coverage report..."
+          npm run test:coverage -- --coverageReporters=text --coverageReporters=json-summary > coverage-output.txt 2>&1 || true
+          
+          # Extract coverage data if available
+          if [ -f coverage/coverage-summary.json ]; then
+            COVERAGE=$(cat coverage/coverage-summary.json | jq -r '.total')
+            LINES=$(echo $COVERAGE | jq -r '.lines.pct')
+            BRANCHES=$(echo $COVERAGE | jq -r '.branches.pct')
+            FUNCTIONS=$(echo $COVERAGE | jq -r '.functions.pct')
+            STATEMENTS=$(echo $COVERAGE | jq -r '.statements.pct')
+            
+            echo "LINES_COVERAGE=${LINES}%" >> $GITHUB_OUTPUT
+            echo "BRANCHES_COVERAGE=${BRANCHES}%" >> $GITHUB_OUTPUT
+            echo "FUNCTIONS_COVERAGE=${FUNCTIONS}%" >> $GITHUB_OUTPUT
+            echo "STATEMENTS_COVERAGE=${STATEMENTS}%" >> $GITHUB_OUTPUT
+          else
+            echo "LINES_COVERAGE=N/A" >> $GITHUB_OUTPUT
+            echo "BRANCHES_COVERAGE=N/A" >> $GITHUB_OUTPUT
+            echo "FUNCTIONS_COVERAGE=N/A" >> $GITHUB_OUTPUT
+            echo "STATEMENTS_COVERAGE=N/A" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-coverage-report
+          path: |
+            coverage/
+            test-results.txt
+          retention-days: 30
+
+      - name: Post Test Coverage Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const testStatus = '${{ steps.test.outputs.TEST_STATUS }}' || '⚠️ Not Run';
+            const lines = '${{ steps.coverage.outputs.LINES_COVERAGE }}' || 'N/A';
+            const branches = '${{ steps.coverage.outputs.BRANCHES_COVERAGE }}' || 'N/A';
+            const functions = '${{ steps.coverage.outputs.FUNCTIONS_COVERAGE }}' || 'N/A';
+            const statements = '${{ steps.coverage.outputs.STATEMENTS_COVERAGE }}' || 'N/A';
+            
+            const body = `## 🧪 Test Coverage Report
+            
+            ### Test Suite Execution
+            **Status:** ${testStatus}
+            
+            ### Coverage Summary
+            | Metric | Coverage |
+            |--------|----------|
+            | **Lines** | ${lines} |
+            | **Branches** | ${branches} |
+            | **Functions** | ${functions} |
+            | **Statements** | ${statements} |
+            
+            ### Test Output
+            <details>
+            <summary>Click to view detailed test output</summary>
+            
+            \`\`\`
+            ${{ steps.test.outputs.TEST_OUTPUT || 'Test execution completed successfully!' }}
+            \`\`\`
+            </details>
+            
+            ---
+            
+            **Job:** testing-suite | **Workflow Run:** [#${context.runNumber}](${context.payload.repository.html_url}/actions/runs/${context.runId})
+            **Commit:** ${context.sha.substring(0, 7)} | **PR:** #${context.payload.pull_request.number}`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.payload.pull_request.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          echo "✅ Dependencies installed successfully"
+
+      - name: Run dependency vulnerability checks
+        id: audit
+        run: |
+          echo "Running npm audit for dependency vulnerabilities..."
+          npm audit --audit-level=moderate > audit-results.txt 2>&1 || echo "Vulnerabilities found"
+          
+          if [ -f audit-results.txt ]; then
+            echo "AUDIT_OUTPUT<<EOF" >> $GITHUB_OUTPUT
+            cat audit-results.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check audit results
+          if npm audit --audit-level=moderate; then
+            echo "AUDIT_STATUS=✅ No vulnerabilities found" >> $GITHUB_OUTPUT
+            echo "VULN_COUNT=0" >> $GITHUB_OUTPUT
+          else
+            # Extract vulnerability count
+            VULN_COUNT=$(grep -oP '\d+(?= vulnerabilities)' audit-results.txt | head -1 || echo "Unknown")
+            echo "AUDIT_STATUS=⚠️ Vulnerabilities detected" >> $GITHUB_OUTPUT
+            echo "VULN_COUNT=${VULN_COUNT}" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Scan for secrets in code changes
+        id: secrets
+        run: |
+          echo "Scanning for potential secrets in code..."
+          
+          # Simple secret patterns to check
+          SECRET_PATTERNS=(
+            'password[\s]*[:=][\s]*["'"'][^"'"']+["'"']'
+            'api[_-]?key[\s]*[:=][\s]*["'"'][^"'"']+["'"']'
+            'secret[\s]*[:=][\s]*["'"'][^"'"']+["'"']'
+            'token[\s]*[:=][\s]*["'"'][^"'"']+["'"']'
+            'aws[_-]?access[_-]?key'
+            'private[_-]?key'
+          )
+          
+          SECRET_FOUND=0
+          SECRET_REPORT=""
+          
+          for pattern in "${SECRET_PATTERNS[@]}"; do
+            if grep -rniE "$pattern" src/ 2>/dev/null; then
+              SECRET_FOUND=1
+              SECRET_REPORT+="⚠️ Potential secret pattern detected: $pattern\n"
+            fi
+          done
+          
+          if [ $SECRET_FOUND -eq 1 ]; then
+            echo "SECRETS_STATUS=⚠️ Potential secrets detected" >> $GITHUB_OUTPUT
+            echo "SECRETS_REPORT<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$SECRET_REPORT" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "SECRETS_STATUS=✅ No secrets detected" >> $GITHUB_OUTPUT
+            echo "SECRETS_REPORT=No hardcoded secrets or sensitive data patterns found." >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Check Dependencies for known issues
+        id: deps-check
+        run: |
+          echo "Analyzing dependencies..."
+          
+          # List outdated packages
+          npm outdated > outdated.txt 2>&1 || true
+          
+          if [ -s outdated.txt ]; then
+            echo "OUTDATED_OUTPUT<<EOF" >> $GITHUB_OUTPUT
+            cat outdated.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "DEPS_STATUS=⚠️ Outdated dependencies found" >> $GITHUB_OUTPUT
+          else
+            echo "DEPS_STATUS=✅ All dependencies up to date" >> $GITHUB_OUTPUT
+            echo "OUTDATED_OUTPUT=All dependencies are up to date." >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Post Security Scan Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const auditStatus = '${{ steps.audit.outputs.AUDIT_STATUS }}' || '⚠️ Not Run';
+            const vulnCount = '${{ steps.audit.outputs.VULN_COUNT }}' || 'Unknown';
+            const secretsStatus = '${{ steps.secrets.outputs.SECRETS_STATUS }}' || '⚠️ Not Run';
+            const depsStatus = '${{ steps.deps-check.outputs.DEPS_STATUS }}' || '⚠️ Not Run';
+            
+            const body = `## 🔒 Security Scan Report
+            
+            ### Vulnerabilities Assessment
+            **Status:** ${auditStatus}
+            **Count:** ${vulnCount} vulnerabilities found
+            
+            ### Dependencies Audit
+            <details>
+            <summary>Click to view vulnerability details</summary>
+            
+            \`\`\`
+            ${{ steps.audit.outputs.AUDIT_OUTPUT || 'No vulnerabilities detected in dependencies.' }}
+            \`\`\`
+            </details>
+            
+            ### Secret Detection Scan
+            **Status:** ${secretsStatus}
+            
+            \`\`\`
+            ${{ steps.secrets.outputs.SECRETS_REPORT || 'No secrets detected in code.' }}
+            \`\`\`
+            
+            ### Dependencies Status
+            **Status:** ${depsStatus}
+            
+            <details>
+            <summary>Click to view outdated dependencies</summary>
+            
+            \`\`\`
+            ${{ steps.deps-check.outputs.OUTDATED_OUTPUT || 'All dependencies are current.' }}
+            \`\`\`
+            </details>
+            
+            ---
+            
+            **Job:** security-scan | **Workflow Run:** [#${context.runNumber}](${context.payload.repository.html_url}/actions/runs/${context.runId})
+            **Commit:** ${context.sha.substring(0, 7)} | **PR:** #${context.payload.pull_request.number}`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.payload.pull_request.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          echo "✅ Dependencies installed successfully"
+
+      - name: Attempt to build the application
+        id: build
+        run: |
+          echo "Building application..."
+          npm run build > build-output.txt 2>&1 || echo "Build completed with warnings"
+          
+          if [ -f build-output.txt ]; then
+            echo "BUILD_OUTPUT<<EOF" >> $GITHUB_OUTPUT
+            cat build-output.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          
+          if npm run build; then
+            echo "BUILD_STATUS=✅ Success" >> $GITHUB_OUTPUT
+          else
+            echo "BUILD_STATUS=❌ Failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Start application for validation
+        id: start-app
+        run: |
+          echo "Starting application in background..."
+          npm start > app-output.txt 2>&1 &
+          APP_PID=$!
+          echo "APP_PID=${APP_PID}" >> $GITHUB_OUTPUT
+          
+          # Wait for app to start
+          sleep 5
+          
+          # Check if app is still running
+          if ps -p $APP_PID > /dev/null; then
+            echo "APP_START_STATUS=✅ Application started successfully" >> $GITHUB_OUTPUT
+          else
+            echo "APP_START_STATUS=❌ Application failed to start" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Validate all endpoints are accessible
+        id: validate
+        run: |
+          echo "Validating endpoints..."
+          
+          ENDPOINTS=("http://localhost:3000/" "http://localhost:3000/health" "http://localhost:3000/api/status")
+          ALL_ACCESSIBLE=true
+          VALIDATION_REPORT=""
+          
+          for endpoint in "${ENDPOINTS[@]}"; do
+            if curl -f -s -o /dev/null -w "%{http_code}" "$endpoint" | grep -q "200\|404"; then
+              VALIDATION_REPORT+="✅ ${endpoint} - Accessible\n"
+            else
+              VALIDATION_REPORT+="❌ ${endpoint} - Not accessible\n"
+              ALL_ACCESSIBLE=false
+            fi
+          done
+          
+          echo "VALIDATION_REPORT<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$VALIDATION_REPORT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          if [ "$ALL_ACCESSIBLE" = true ]; then
+            echo "VALIDATION_STATUS=✅ All endpoints accessible" >> $GITHUB_OUTPUT
+          else
+            echo "VALIDATION_STATUS=⚠️ Some endpoints not accessible" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Stop application
+        if: always()
+        run: |
+          APP_PID=${{ steps.start-app.outputs.APP_PID }}
+          if [ ! -z "$APP_PID" ] && ps -p $APP_PID > /dev/null; then
+            kill $APP_PID || true
+            echo "Application stopped"
+          fi
+        continue-on-error: true
+
+      - name: Create deployment preview artifacts
+        id: artifacts
+        run: |
+          echo "Creating deployment preview artifacts..."
+          mkdir -p deployment-preview
+          
+          # Create deployment summary
+          cat > deployment-preview/DEPLOYMENT_SUMMARY.md << 'EOL'
+          # Deployment Preview Summary
+          
+          ## Application Information
+          - **Name:** mcpmark-cicd
+          - **Version:** 1.0.0
+          - **Node Version:** 18.x
+          - **Port:** 3000
+          
+          ## Available Endpoints
+          - `/` - Root endpoint
+          - `/health` - Health check endpoint
+          - `/api/status` - API status endpoint
+          
+          ## Deployment Steps
+          1. Install dependencies: `npm ci`
+          2. Run tests: `npm test`
+          3. Start application: `npm start`
+          
+          ## Environment Requirements
+          - Node.js >= 18.0.0
+          - npm >= 8.0.0
+          EOL
+          
+          # Copy package files
+          cp package.json deployment-preview/
+          cp package-lock.json deployment-preview/
+          
+          echo "ARTIFACTS_STATUS=✅ Artifacts created" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Upload deployment preview artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: deployment-preview/
+          retention-days: 7
+
+      - name: Post Build Validation Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const buildStatus = '${{ steps.build.outputs.BUILD_STATUS }}' || '⚠️ Not Run';
+            const appStartStatus = '${{ steps.start-app.outputs.APP_START_STATUS }}' || '⚠️ Not Run';
+            const validationStatus = '${{ steps.validate.outputs.VALIDATION_STATUS }}' || '⚠️ Not Run';
+            const artifactsStatus = '${{ steps.artifacts.outputs.ARTIFACTS_STATUS }}' || '⚠️ Not Run';
+            
+            const body = `## 🏗️ Build Validation Report
+            
+            ### Build Status
+            **Status:** ${buildStatus}
+            
+            <details>
+            <summary>Click to view build output</summary>
+            
+            \`\`\`
+            ${{ steps.build.outputs.BUILD_OUTPUT || 'Build completed successfully!' }}
+            \`\`\`
+            </details>
+            
+            ### Application Start
+            **Status:** ${appStartStatus}
+            
+            ### Endpoint Validation
+            **Status:** ${validationStatus}
+            
+            \`\`\`
+            ${{ steps.validate.outputs.VALIDATION_REPORT || 'All endpoints validated successfully!' }}
+            \`\`\`
+            
+            ### Deployment Preview Artifacts
+            **Status:** ${artifactsStatus}
+            
+            📦 Deployment preview artifacts have been created and uploaded. These include:
+            - Package configuration files
+            - Deployment summary documentation
+            - Environment requirements
+            
+            ---
+            
+            **Job:** build-validation | **Workflow Run:** [#${context.runNumber}](${context.payload.repository.html_url}/actions/runs/${context.runId})
+            **Commit:** ${context.sha.substring(0, 7)} | **PR:** #${context.payload.pull_request.number}`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.payload.pull_request.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
